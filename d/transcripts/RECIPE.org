@@ -21,17 +21,17 @@ Recorded talk in three layers, each citing the one below:
 | =bin/tr3rm= | subjects to RESULT: each seam with the pin that holds it, or still raised; =check= proves every citation |
 | =bin/tr2vs= | two readers of one recording, counted |
 | =tests/tr-spec.sh= | the second reader, sh + awk |
-| =transcripts/SET/= | =q1/= quotes, =s2/= subjects and result, =README.md=, sometimes =READING.md=, =VERSUS.md=, =SWEEP.tsv= |
+| =d/transcripts/SET/= | =q1/= quotes, =s2/= subjects and result, =README.md=, sometimes =READING.md=, =VERSUS.md=, =SWEEP.tsv= |
 
 * Make a set
 
 Phase 1 needs python3 with faster-whisper. Phases 2 and 3 need only python3. Run =sweep= before trusting a floor. Readings in =SUMMARIES.tsv= name who made them: a person, Claude, or a local model through llama-bridge.
 
 #+begin_src sh
-python3 bin/tr1qt AUDIO... --out transcripts/SET/q1 --work
-python3 bin/tr2sm sweep transcripts/SET/q1/* --anchor ANCHOR.md
-python3 bin/tr2sm build transcripts/SET/q1/* --anchor ANCHOR.md --out transcripts/SET/s2
-python3 bin/tr3rm build transcripts/SET/s2 transcripts/SET/q1/* --summaries transcripts/SET/SUMMARIES.tsv --title "..."
+python3 bin/tr1qt AUDIO... --out d/transcripts/SET/q1 --work
+python3 bin/tr2sm sweep d/transcripts/SET/q1/* --anchor ANCHOR.md
+python3 bin/tr2sm build d/transcripts/SET/q1/* --anchor ANCHOR.md --out d/transcripts/SET/s2
+python3 bin/tr3rm build d/transcripts/SET/s2 d/transcripts/SET/q1/* --summaries d/transcripts/SET/SUMMARIES.tsv --title "..."
 #+end_src
 
 * Check every set, and the tools
@@ -39,7 +39,7 @@ python3 bin/tr3rm build transcripts/SET/s2 transcripts/SET/q1/* --summaries tran
 Expect =0 fault(s)= for every set, and every =--prove-red= at its full count.
 
 #+begin_src sh
-for s in transcripts/*/; do
+for s in d/transcripts/*/; do
   [ -d "$s/s2" ] || continue
   python3 bin/tr3rm check "$s/s2" "$s"/q1/* | tail -1
   sh tests/tr-spec.sh "$s/s2" "$s"/q1/* | tail -1

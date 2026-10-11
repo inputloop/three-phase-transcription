@@ -4,4 +4,4 @@ bin/tr2sm
 bin/tr3rm
 bin/tr2vs
 tests/tr-spec.sh
-transcripts/RECIPE.org
+d/transcripts/RECIPE.org
