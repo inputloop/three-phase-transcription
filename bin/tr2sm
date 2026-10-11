@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+# tr2sm -- TRANSCRIPT 2 SUBJECT MODELS: phase two of three.  Quotes by time in, subject-centric
+#          context models out, doubly linked back to the quotes.
+#   Copyright 2026 Corwin Brust <corwin@bru.st> and Contributors.  Authored by Mentat (for Corwin).
+#   SPDX-License-Identifier: GPL-3.0-or-later OR LGPL-3.0-or-later
+#   This program is free software: you can redistribute it and/or modify it under the terms of the
+#   GNU General Public License (or the GNU Lesser General Public License), version 3 or later.
+#
+# WHY: his ask, 2026-10-10: "quotes by time -> subject centric context models ... acting as memory
+#   like bastion stations to interweave facts ... -> result model".  A subject is a station: every
+#   quote lands at exactly one, each station lists the quotes it holds (forward), and LINKS.tsv says
+#   for every quote which station holds it (backward).  Nothing here paraphrases; it only groups.
+#
+# usage: tr2sm build QDIR... --out DIR [--anchor DOC.md] [--window 20] [--floor F]
+#        tr2sm sweep QDIR... --anchor DOC.md      how many windows each floor would anchor (calibrate)
+#        tr2sm --prove-red
+#   QDIR is a tr1qt output folder (QUOTES.tsv + PROVENANCE).  Several QDIRs are one conversation,
+#   in the order given.
+#   --anchor  a markdown document the talk was about (a letter read aloud, an agenda).  Its "## "
+#             sections become subject seeds; a window joins the seed it shares the most distinctive
+#             words with, if the share reaches --floor.  Windows that reach no seed are grouped into
+#             FREE subjects named by their own most distinctive words.
+#   writes DIR/INDEX.md            the stations in order of first appearance, spans and counts
+#          DIR/<slug>.md           one station: its seed text (if anchored), its spans with every quote
+#                                  verbatim and cited "[stem hh:mm:ss]", and prev/next stations
+#          DIR/LINKS.tsv           key<TAB>slug for every quote (key = stem@start_s): the back-links
+#          DIR/SUBJECTS.tsv        slug<TAB>kind<TAB>title<TAB>first_key<TAB>n_quotes<TAB>n_spans
+#   MUST     every quote row of every QDIR lands in exactly one subject; never edits a QDIR;
+#            refuses an existing DIR/LINKS.tsv.
+#   JOURNEY  the window (20 s, measured; see WINDOW), the floor (default from his 2026-10-10 sweep, see --floor), the stop
+#            list, slugging.  Readings from one day's audio; sweep before trusting a new floor.
+import collections, math, os, re, sys
+
+STOP = set("""a about above after again against all am an and any are aren't as at be because been
+before being below between both but by can can't cannot could couldn't did didn't do does doesn't
+doing don't down during each few for from further had hadn't has hasn't have haven't having he he'd
+he'll he's her here here's hers herself him himself his how how's i i'd i'll i'm i've if in into is
+isn't it it's its itself let's me more most mustn't my myself no nor not of off on once only or other
+ought our ours ourselves out over own same shan't she she'd she'll she's should shouldn't so some such
+than that that's the their theirs them themselves then there there's these they they'd they'll they're
+they've this those through to too under until up very was wasn't we we'd we'll we're we've were weren't
+what what's when when's where where's which while who who's whom why why's with won't would wouldn't
+you you'd you'll you're you've your yours yourself yourselves yeah yes okay ok right like just know
+think going gonna get got really one thing things want mean well also now say said see oh um uh kind
+sort lot actually little bit back way something go make sure need yep alright let us
+wanna gotta shit fuck fucking damn even every ever unless anyway stuff guess maybe pretty probably""".split())
+WORD = re.compile(r"[a-z][a-z0-9'+-]{2,}")
+WINDOW = 20    # seconds; measured 2026-10-11 by tr2vs against the TA remodel reader: 20 s filed 78.6% of cited lines under
+               # the same finding, 60 s 60.2%, 90 s 45.5% (10 s 75.9%, 30 s 74.4%); JOURNEY: re-measure with tr2vs when a
+               # second reader exists.  Sets built before this keep the window their INDEX.md records.
+FLOOR = 0.20   # knee of the 2026-10-10 sweep (graphine reading, 16 seeds): 0.20 anchors 33 of 70 windows, 0.25 only 19; JOURNEY: re-sweep for a new talk
+
+def words(t):
+    return [w.strip("'") for w in WORD.findall(t.lower()) if w.strip("'") not in STOP and len(w.strip("'")) > 2]
+
+def hms(s):
+    s = int(float(s)); return "%02d:%02d:%02d" % (s // 3600, s % 3600 // 60, s % 60)
+
+def load(qdirs):
+    rows = []
+    for q in qdirs:
+        stem = os.path.basename(os.path.normpath(q))
+        for ln in open(os.path.join(q, "QUOTES.tsv"), encoding="utf-8"):
+            p = ln.rstrip("\n").split("\t")
+            if len(p) == 4:
+                rows.append({"i": len(rows), "stem": stem, "start": float(p[0]), "end": float(p[1]), "text": p[3],
+                             "key": "%s@%s" % (stem, p[0])})
+    return rows
+
+def windows(rows, width):
+    out, cur, t0, stem = [], [], None, None
+    for r in rows:
+        if cur and (r["stem"] != stem or r["start"] - t0 >= width):
+            out.append(cur); cur = []
+        if not cur: t0, stem = r["start"], r["stem"]
+        cur.append(r)
+    if cur: out.append(cur)
+    return out
+
+def slug(s, used):
+    sec, _, item = s.rpartition(": ")
+    if sec and item:   # an item seed: keep the item whole, shorten the section
+        b = (re.sub(r"[^a-z0-9]+", "-", sec.lower()).strip("-")[:16].rstrip("-") + "-" +
+             re.sub(r"[^a-z0-9]+", "-", item.lower()).strip("-"))[:40].strip("-")
+    else:
+        b = re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:40]
+    b = b or "subject"
+    s2, n = b, 2
+    while s2 in used: s2 = "%s-%d" % (b, n); n += 1
+    used.add(s2); return s2
+
+def seeds_from(doc):
+    """A "## " section is a seed; inside it, each list item led by bold text ("- **Code** ...",
+    "1. **Delete ...**") is a seed of its own, titled "Section: bold".  Lines before the first item
+    stay with the section seed.  Table rows count as body text of the seed they sit under."""
+    seeds, sec, cur = [], None, None
+    item = re.compile(r"^\s*(?:[-*]|\d+\.)\s+\*\*(.+?)\*\*:?\s*(.*)")
+    for ln in open(doc, encoding="utf-8"):
+        ln = ln.rstrip("\n")
+        if ln.startswith("## "):
+            sec = ln[3:].strip(); cur = {"title": sec, "body": []}; seeds.append(cur); continue
+        if sec is None: continue
+        m = item.match(ln)
+        if m:
+            cur = {"title": "%s: %s" % (sec, m.group(1).strip(" :*")), "body": [ln]}; seeds.append(cur)
+        elif cur is not None:
+            cur["body"].append(ln)
+    return [s for s in seeds if (s["title"] + " ".join(s["body"])).strip()]
+
+def idf_weights(bags):
+    df = collections.Counter(w for b in bags for w in set(b))
+    n = len(bags)
+    return {w: math.log((n + 1) / (c + 0.5)) for w, c in df.items()}
+
+def score(win_words, seed_vec):
+    if not win_words: return 0.0
+    hit = sum(seed_vec.get(w, 0.0) for w in set(win_words))
+    tot = sum(seed_vec.values()) or 1.0
+    return hit / math.sqrt(tot * len(set(win_words)))
+
+def assign(rows, wins, seeds, floor):
+    vecs = []
+    if seeds:
+        bags = [words(s["title"] + " " + " ".join(s["body"])) for s in seeds]
+        idf = idf_weights(bags)
+        for b in bags:
+            c = collections.Counter(b)
+            vecs.append({w: c[w] * idf[w] for w in c})
+    labels = []
+    for w in wins:
+        ww = words(" ".join(r["text"] for r in w))
+        best, bi = 0.0, None
+        for i, v in enumerate(vecs):
+            s = score(ww, v)
+            if s > best: best, bi = s, i
+        labels.append(("A", bi, best) if bi is not None and best >= floor else ("F", None, best))
+    return labels
+
+def tile(wins, idf):
+    """Split a run of FREE windows where the talk changes, by TextTiling (Hearst 1997): the
+    similarity across each gap (two windows each side, idf-weighted cosine), each gap's depth
+    (how far it dips below the peaks on both sides), and a boundary wherever the depth exceeds
+    mean - sd/2 of all depths in the run (Hearst's own cutoff, so no number is picked here).
+    Runs under four windows are not split.  Returns lists of windows."""
+    n = len(wins)
+    if n < 4: return [wins]
+    vec = []
+    for w in wins:
+        c = collections.Counter(x for r in w for x in words(r["text"]))
+        vec.append({k: v * idf.get(k, 1.0) for k, v in c.items()})
+    def cos(a, b):
+        num = sum(a[k] * b.get(k, 0.0) for k in a)
+        den = math.sqrt(sum(v * v for v in a.values()) * sum(v * v for v in b.values())) or 1.0
+        return num / den
+    def merge(vs):
+        m = collections.Counter()
+        for v in vs: m.update(v)
+        return m
+    sims = [cos(merge(vec[max(0, g - 1):g + 1]), merge(vec[g + 1:g + 3])) for g in range(n - 1)]
+    depth = []
+    for g in range(len(sims)):
+        l = max(sims[:g + 1]); r = max(sims[g:])
+        lp = g
+        while lp > 0 and sims[lp - 1] >= sims[lp]: lp -= 1
+        rp = g
+        while rp < len(sims) - 1 and sims[rp + 1] >= sims[rp]: rp += 1
+        depth.append((sims[lp] - sims[g]) + (sims[rp] - sims[g]))
+    mu = sum(depth) / len(depth)
+    sd = math.sqrt(sum((d - mu) ** 2 for d in depth) / len(depth))
+    cut = mu - sd / 2
+    out, cur = [], [wins[0]]
+    for g in range(len(sims)):
+        local_max = (g == 0 or depth[g] >= depth[g - 1]) and (g == len(sims) - 1 or depth[g] >= depth[g + 1])
+        if depth[g] > cut and local_max and depth[g] > 0:
+            out.append(cur); cur = []
+        cur.append(wins[g + 1])
+    out.append(cur)
+    return out
+
+def free_title(ws, all_counts, total):
+    c = collections.Counter(w for win in ws for r in win for w in words(r["text"]))
+    n = sum(c.values()) or 1
+    key = sorted(c, key=lambda w: (-(c[w] / n) * math.log((total + 1) / (all_counts[w] + 1)) * min(c[w], 3), w))
+    return " / ".join(key[:3]) or "talk"
+
+def build(qdirs, out, anchor, width, floor):
+    rows = load(qdirs)
+    if not rows: sys.exit("tr2sm: no quotes in %s" % " ".join(qdirs))
+    if os.path.exists(os.path.join(out, "LINKS.tsv")): sys.exit("tr2sm: %s/LINKS.tsv exists; refusing" % out)
+    os.makedirs(out, exist_ok=True)
+    wins = windows(rows, width)
+    seeds = seeds_from(anchor) if anchor else []
+    labels = assign(rows, wins, seeds, floor)
+    allc = collections.Counter(w for r in rows for w in words(r["text"])); total = sum(allc.values())
+    gidf = idf_weights([words(" ".join(r["text"] for r in w)) for w in wins])
+    # runs of adjacent FREE windows become one free subject each; anchored windows join their seed
+    subjects, order, used = {}, [], set()
+    seed_slug = {}
+    i = 0
+    while i < len(wins):
+        kind, si, _ = labels[i]
+        if kind == "A":
+            if si not in seed_slug:
+                seed_slug[si] = slug(seeds[si]["title"], used)
+                subjects[seed_slug[si]] = {"kind": "ANCHORED", "title": seeds[si]["title"],
+                                           "seed": seeds[si], "spans": []}
+                order.append(seed_slug[si])
+            subjects[seed_slug[si]]["spans"].append(wins[i]); i += 1
+        else:
+            j = i
+            while j < len(wins) and labels[j][0] == "F": j += 1
+            for part in tile(wins[i:j], gidf):
+                title = free_title(part, allc, total)
+                s = slug("free-" + title, used)
+                subjects[s] = {"kind": "FREE", "title": title, "seed": None, "spans": [sum(part, [])]}
+                order.append(s)
+            i = j
+    # merge adjacent spans within a subject when they touch (one row follows the other)
+    for s in subjects.values():
+        merged = []
+        for sp in s["spans"]:
+            if merged and merged[-1][-1]["i"] + 1 == sp[0]["i"]: merged[-1] = merged[-1] + sp
+            else: merged.append(list(sp))
+        s["spans"] = merged
+    links = []
+    for s in order:
+        for sp in subjects[s]["spans"]:
+            for r in sp: links.append((r["key"], s))
+    assert len(links) == len(rows) and len(set(k for k, _ in links)) == len(rows), "partition broken"
+    pos = {r["key"]: r["i"] for r in rows}
+    with open(os.path.join(out, "LINKS.tsv"), "w") as f:
+        for k, s in sorted(links, key=lambda x: pos[x[0]]):
+            f.write("%s\t%s\n" % (k, s))
+    with open(os.path.join(out, "SUBJECTS.tsv"), "w") as f:
+        for s in order:
+            sb = subjects[s]; n = sum(len(sp) for sp in sb["spans"])
+            f.write("%s\t%s\t%s\t%s\t%d\t%d\n" % (s, sb["kind"], sb["title"], sb["spans"][0][0]["key"], n, len(sb["spans"])))
+    cite = lambda r: "[%s %s]" % (r["stem"], hms(r["start"]))
+    for k, s in enumerate(order):
+        sb = subjects[s]
+        with open(os.path.join(out, s + ".md"), "w") as f:
+            f.write("# Subject: %s\n\n" % sb["title"])
+            f.write("Phase 2 of 3 (subject-centric context model), made by `tr2sm`. Kind: %s. " % sb["kind"])
+            f.write("Quotes are machine transcription; each line cites its recording and time.\n\n")
+            f.write("- before: %s\n- after: %s\n- back to: [INDEX](INDEX.md)\n\n" % (
+                "[%s](%s.md)" % (subjects[order[k-1]]["title"], order[k-1]) if k else "(start)",
+                "[%s](%s.md)" % (subjects[order[k+1]]["title"], order[k+1]) if k + 1 < len(order) else "(end)"))
+            if sb["seed"]:
+                f.write("## What the anchor says\n\n")
+                for ln in sb["seed"]["body"]:
+                    f.write("> %s\n" % ln if ln.strip() else ">\n")
+                f.write("\n")
+            f.write("## What was said\n\n")
+            for sp in sb["spans"]:
+                f.write("### %s to %s\n\n" % (cite(sp[0]), cite(sp[-1])))
+                for r in sp: f.write("%s %s\n" % (cite(r), r["text"]))
+                f.write("\n")
+    with open(os.path.join(out, "INDEX.md"), "w") as f:
+        f.write("# Subjects\n\nPhase 2 of 3, made by `tr2sm` from %s.\n" % ", ".join(os.path.basename(os.path.normpath(q)) for q in qdirs))
+        import hashlib
+        f.write("Tool sha256 %s. " % hashlib.sha256(open(os.path.abspath(__file__), "rb").read()).hexdigest()[:16])
+        f.write("Anchor: %s. Window %ds, floor %.2f. %d quotes in %d subjects; every quote is in exactly one (LINKS.tsv).\n\n" % (
+            os.path.basename(anchor) if anchor else "none", width, floor, len(rows), len(order)))
+        f.write("| # | subject | kind | first said | quotes | spans |\n|---|---|---|---|---|---|\n")
+        for k, s in enumerate(order, 1):
+            sb = subjects[s]; n = sum(len(sp) for sp in sb["spans"])
+            f.write("| %d | [%s](%s.md) | %s | %s | %d | %d |\n" % (k, sb["title"], s, sb["kind"].lower(), cite(sb["spans"][0][0]), n, len(sb["spans"])))
+    print("tr2sm: %d quotes -> %d subjects (%d anchored, %d free) in %s" % (
+        len(rows), len(order), sum(subjects[s]["kind"] == "ANCHORED" for s in order),
+        sum(subjects[s]["kind"] == "FREE" for s in order), out))
+
+def sweep(qdirs, anchor, width):
+    rows = load(qdirs); wins = windows(rows, width); seeds = seeds_from(anchor)
+    lab = assign(rows, wins, seeds, 0.0)
+    print("floor\tanchored_windows\tof\tseeds_reached")
+    for f in [0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.20, 0.25, 0.30]:
+        a = [l for l in lab if l[2] >= f and l[1] is not None]
+        print("%.2f\t%d\t%d\t%d" % (f, len(a), len(lab), len(set(l[1] for l in a))))
+
+def prove_red():
+    import tempfile, shutil
+    t = tempfile.mkdtemp(); fired = n = 0
+    q = os.path.join(t, "rec"); os.makedirs(q)
+    with open(os.path.join(q, "QUOTES.tsv"), "w") as f:
+        lines = ["we agreed the licence is GPL or LGPL for code", "the garden view works offline",
+                 "lunch was good today honestly", "writing goes under creative commons share alike"]
+        for i, s in enumerate(lines): f.write("%.2f\t%.2f\t%s\t%s\n" % (i * 70, i * 70 + 5, hms(i * 70), s))
+    doc = os.path.join(t, "a.md")
+    open(doc, "w").write("# L\n## Terms\ncode GPL LGPL licence writing creative commons share alike\n## Garden\ngarden view offline page\n")
+    out = os.path.join(t, "o"); build([q], out, doc, 60, 0.1)
+    L = dict(l.rstrip("\n").split("\t") for l in open(os.path.join(out, "LINKS.tsv")))
+    n += 1; fired += len(L) == 4                                  # plant 1: partition, every quote once
+    n += 1; fired += L["rec@0.00"] == L["rec@210.00"]             # plant 2: same seed reached twice -> one station
+    n += 1; fired += L["rec@140.00"].startswith("free-")          # plant 3: off-anchor talk is FREE, not forced
+    try: build([q], out, doc, 60, 0.1); ok = False                # plant 4: refuses to overwrite
+    except SystemExit: ok = True
+    n += 1; fired += ok
+    txt = open(os.path.join(out, L["rec@70.00"] + ".md")).read()
+    n += 1; fired += "[rec 00:01:10] the garden view works offline" in txt   # plant 5: verbatim, cited
+    # plant 6: without an anchor, a clear change of talk splits into two FREE subjects
+    q2 = os.path.join(t, "rec2"); os.makedirs(q2)
+    with open(os.path.join(q2, "QUOTES.tsv"), "w") as f:
+        a_ = ["licence gpl code copyleft source"] * 4 + ["movie actor film comedy scene"] * 4
+        for i, x in enumerate(a_): f.write("%.2f\t%.2f\t%s\t%s\n" % (i * 70, i * 70 + 5, hms(i * 70), x))
+    o2 = os.path.join(t, "o2"); build([q2], o2, None, 60, 0.2)
+    L2 = dict(l.rstrip("\n").split("\t") for l in open(os.path.join(o2, "LINKS.tsv")))
+    n += 1; fired += L2["rec2@0.00"] != L2["rec2@490.00"] and L2["rec2@0.00"] == L2["rec2@140.00"]
+    # plant 7: a run with no change of talk stays one subject
+    q3 = os.path.join(t, "rec3"); os.makedirs(q3)
+    with open(os.path.join(q3, "QUOTES.tsv"), "w") as f:
+        for i in range(6): f.write("%.2f\t%.2f\t%s\tlicence gpl code copyleft source\n" % (i * 70, i * 70 + 5, hms(i * 70)))
+    o3 = os.path.join(t, "o3"); build([q3], o3, None, 60, 0.2)
+    n += 1; fired += len(set(l.split("\t")[1] for l in open(os.path.join(o3, "LINKS.tsv")))) == 1
+    # plant 8: an item seed keeps its own ID in the slug, however long the section's name
+    q4 = os.path.join(t, "rec4"); os.makedirs(q4)
+    open(os.path.join(q4, "QUOTES.tsv"), "w").write("0.00\t2.00\t00:00:00\tthe garden view works offline\n")
+    d4 = os.path.join(t, "a4.md")
+    open(d4, "w").write("## C. A very long section name about principles of the new work\n- **F12.** the garden view works offline\n")
+    o4 = os.path.join(t, "o4"); build([q4], o4, d4, 20, 0.0)
+    n += 1; fired += open(os.path.join(o4, "LINKS.tsv")).read().rstrip().endswith("-f12")
+    shutil.rmtree(t)
+    print("tr2sm --prove-red: %d/%d planted cases read as planted" % (fired, n))
+    return 0 if fired == n else 1
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    if not a: print("usage: tr2sm build|sweep QDIR... [--out DIR] [--anchor DOC]  |  tr2sm --prove-red"); sys.exit(2)
+    if a[0] == "--prove-red": sys.exit(prove_red())
+    verb, a = a[0], a[1:]
+    out, anchor, width, floor, q = None, None, WINDOW, FLOOR, []
+    i = 0
+    while i < len(a):
+        if a[i] == "--out": out = a[i + 1]; i += 2
+        elif a[i] == "--anchor": anchor = a[i + 1]; i += 2
+        elif a[i] == "--window": width = int(a[i + 1]); i += 2
+        elif a[i] == "--floor": floor = float(a[i + 1]); i += 2
+        else: q.append(a[i]); i += 1
+    if verb == "sweep": sweep(q, anchor, width)
+    elif verb == "build" and out: build(q, out, anchor, width, floor)
+    else: sys.exit("tr2sm: build needs --out DIR")

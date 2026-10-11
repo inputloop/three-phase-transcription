@@ -1,0 +1,53 @@
+#+TITLE: transcripts — record to result, and the checks
+#+SUBTITLE: the recipe for the three-phase transcription tools and the sets they make
+#+PROPERTY: header-args:sh :tangle rebuild-transcripts.sh
+#+OPTIONS: toc:nil num:t
+
+* What this is
+
+Recorded talk in three layers, each citing the one below:
+- quotes by time (=bin/tr1qt=)
+- subjects (=bin/tr2sm=)
+- the result (=bin/tr3rm=)
+
+=bin/tr2vs= holds a subject layer against another reader's findings, and =tests/tr-spec.sh= re-reads every set in sh and awk. Each set's =README.md= says who it is for. Family cuts leave this folder out (=d/family/HOLDS.tsv=).
+
+* Parts
+
+| part | what |
+|---|---|
+| =bin/tr1qt= | audio to QUOTES (faster-whisper small.en; =--work= resumes by slice) |
+| =bin/tr2sm= | QUOTES to subjects: anchored on a document's sections, or free talk split where it changes; 20 s windows, measured |
+| =bin/tr3rm= | subjects to RESULT: each seam with the pin that holds it, or still raised; =check= proves every citation |
+| =bin/tr2vs= | two readers of one recording, counted |
+| =tests/tr-spec.sh= | the second reader, sh + awk |
+| =transcripts/SET/= | =q1/= quotes, =s2/= subjects and result, =README.md=, sometimes =READING.md=, =VERSUS.md=, =SWEEP.tsv= |
+
+* Make a set
+
+Phase 1 needs python3 with faster-whisper. Phases 2 and 3 need only python3. Run =sweep= before trusting a floor. Readings in =SUMMARIES.tsv= name who made them: a person, Claude, or a local model through llama-bridge.
+
+#+begin_src sh
+python3 bin/tr1qt AUDIO... --out transcripts/SET/q1 --work
+python3 bin/tr2sm sweep transcripts/SET/q1/* --anchor ANCHOR.md
+python3 bin/tr2sm build transcripts/SET/q1/* --anchor ANCHOR.md --out transcripts/SET/s2
+python3 bin/tr3rm build transcripts/SET/s2 transcripts/SET/q1/* --summaries transcripts/SET/SUMMARIES.tsv --title "..."
+#+end_src
+
+* Check every set, and the tools
+
+Expect =0 fault(s)= for every set, and every =--prove-red= at its full count.
+
+#+begin_src sh
+for s in transcripts/*/; do
+  [ -d "$s/s2" ] || continue
+  python3 bin/tr3rm check "$s/s2" "$s"/q1/* | tail -1
+  sh tests/tr-spec.sh "$s/s2" "$s"/q1/* | tail -1
+done
+for t in tr1qt tr2sm tr3rm tr2vs; do python3 bin/$t --prove-red | tail -1; done
+sh tests/tr-spec.sh --prove-red
+#+end_src
+
+* Rebuild on change
+
+A change to a tool reruns the checks above. A set built by an older tool keeps the window and floor its =s2/INDEX.md= records. Rebuild one only when the reason is written first: a hypothesis, then the rebuild, then the comparison.

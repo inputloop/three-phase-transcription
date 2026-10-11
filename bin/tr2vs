@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+# tr2vs -- TRANSCRIPT 2 VERSUS: hold tr2sm's subject layer up against a reader's own findings file,
+#          finding by finding, through the time ranges the reader cited.  Two readers of one recording.
+#   Copyright 2026 Corwin Brust <corwin@bru.st> and Contributors.  Authored by Mentat (for Corwin).
+#   SPDX-License-Identifier: GPL-3.0-or-later OR LGPL-3.0-or-later
+#
+# WHY: 2026-10-11.  The TA remodel recording was transcribed in three phases twice: by hand-led work on
+#   2026-10-01 (TA-FABEL-REMODEL.1/.2/.3, findings citing "mm:ss-mm:ss" ranges) and by tr1qt/tr2sm/tr3rm.
+#   His ask: contrast work "to mutual proving out".  Neither reader is the answer key.  The count says
+#   where they agree, and the disagreements are the cases to read.
+#
+# usage: tr2vs REF.md S2DIR QDIR...      a table, one row per finding, then the totals
+#        tr2vs --prove-red
+#   REF.md  list items led by a bold ID ("- **F12.** ... (L076-L080, 06:27-07:01)"); every mm:ss-mm:ss
+#           (hyphen or en dash) in an item is one of its ranges.
+#   For each finding: the quotes whose start falls in its ranges; how many tr2sm filed under a
+#   station whose title ends in that ID ("own"); and the station most of them went to ("most").
+#   MUST     reads only; a finding with no ranges is listed as NO RANGES, never counted as agreeing.
+#   JOURNEY  a range is closed at both ends to the second (a line starting at 07:01 belongs to
+#            "06:27-07:01"); one reading of how the reader wrote ranges.
+import collections, os, re, sys
+
+ITEM = re.compile(r"^\s*[-*]\s+\*\*([A-Za-z]+[0-9]+)\.?\*\*")
+RANGE = re.compile(r"(\d{1,2}):(\d\d)\s*[–-]\s*(\d{1,2}):(\d\d)")
+
+
+def findings(path):
+    out = []
+    for ln in open(path, encoding="utf-8"):
+        m = ITEM.match(ln)
+        if m:
+            rs = [(int(a) * 60 + int(b), int(c) * 60 + int(d)) for a, b, c, d in RANGE.findall(ln)]
+            out.append((m.group(1), rs))
+    return out
+
+
+def quotes(qdirs):
+    q = []
+    for d in qdirs:
+        stem = os.path.basename(os.path.normpath(d))
+        for ln in open(os.path.join(d, "QUOTES.tsv"), encoding="utf-8"):
+            p = ln.rstrip("\n").split("\t")
+            if len(p) == 4: q.append(("%s@%s" % (stem, p[0]), float(p[0])))
+    return q
+
+
+def compare(ref, s2, qdirs):
+    F = findings(ref)
+    Q = quotes(qdirs)
+    L = dict(l.rstrip("\n").split("\t") for l in open(os.path.join(s2, "LINKS.tsv"), encoding="utf-8"))
+    title = {l.split("\t")[0]: l.split("\t")[2] for l in open(os.path.join(s2, "SUBJECTS.tsv"), encoding="utf-8")}
+    rows, tot_in, tot_own = [], 0, 0
+    for fid, rs in F:
+        if not rs:
+            rows.append((fid, None, None, None)); continue
+        mine = [k for k, t in Q if any(a <= int(t) <= b for a, b in rs)]
+        own = sum(1 for k in mine if re.search(r"\b%s\.?$" % re.escape(fid), title.get(L.get(k, ""), "")))
+        most = collections.Counter(L.get(k, "?") for k in mine).most_common(1)
+        rows.append((fid, len(mine), own, most[0][0] if most else "-"))
+        tot_in += len(mine); tot_own += own
+    return rows, tot_in, tot_own
+
+
+def report(ref, s2, qdirs):
+    rows, tin, town = compare(ref, s2, qdirs)
+    print("| finding | lines in its ranges | filed under it by tr2sm | most went to |")
+    print("|---|---|---|---|")
+    for fid, n, own, most in rows:
+        if n is None: print("| %s | NO RANGES | | |" % fid); continue
+        print("| %s | %d | %d | %s |" % (fid, n, own, most))
+    pct = (100.0 * town / tin) if tin else 0.0
+    print("\ntr2vs: %d findings, %d cited lines; tr2sm filed %d of them under the same finding (%.1f%%)" % (
+        len(rows), tin, town, pct))
+
+
+def prove_red():
+    import tempfile, shutil
+    t = tempfile.mkdtemp(); fired = n = 0
+    q = os.path.join(t, "rec"); os.makedirs(q); s2 = os.path.join(t, "s2"); os.makedirs(s2)
+    open(os.path.join(q, "QUOTES.tsv"), "w").write("0.00\t2.00\t00:00:00\ta\n65.00\t66.00\t00:01:05\tb\n130.00\t131.00\t00:02:10\tc\n")
+    open(os.path.join(s2, "LINKS.tsv"), "w").write("rec@0.00\ts1\nrec@65.00\ts2\nrec@130.00\ts1\n")
+    open(os.path.join(s2, "SUBJECTS.tsv"), "w").write("s1\tANCHORED\tX: F01\trec@0.00\t2\t2\ns2\tANCHORED\tX: F02\trec@65.00\t1\t1\n")
+    ref = os.path.join(t, "ref.md")
+    open(ref, "w").write("- **F01.** first (00:00–00:30)\n- **F02.** second (01:00-01:10, 02:10-02:10)\n- **F03.** no range\n")
+    rows, tin, town = compare(ref, s2, [q])
+    d = {r[0]: r for r in rows}
+    n += 1; fired += d["F01"][1:3] == (1, 1)            # one line in range, filed under F01
+    n += 1; fired += d["F02"][1:3] == (2, 1)            # two in range (a closed end at 02:10), one filed under F02
+    n += 1; fired += d["F03"][1] is None                 # no ranges: listed, not counted
+    n += 1; fired += (tin, town) == (3, 2)
+    shutil.rmtree(t)
+    print("tr2vs --prove-red: %d/%d planted cases read as planted" % (fired, n))
+    return 0 if fired == n else 1
+
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    if a[:1] == ["--prove-red"]: sys.exit(prove_red())
+    if len(a) < 3: sys.exit("usage: tr2vs REF.md S2DIR QDIR...  |  tr2vs --prove-red")
+    report(a[0], a[1], a[2:])

@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+# tr1qt -- TRANSCRIPT 1 QUOTES: phase one of three.  Audio in, quotes by time out.
+#   Copyright 2026 Corwin Brust <corwin@bru.st> and Contributors.  Authored by Mentat (for Corwin).
+#   SPDX-License-Identifier: GPL-3.0-or-later OR LGPL-3.0-or-later
+#   This program is free software: you can redistribute it and/or modify it under the terms of the
+#   GNU General Public License (or the GNU Lesser General Public License), version 3 or later.
+#
+# WHY: his ask, 2026-10-10: "quotes by time -> subject centric context models -> result model".
+#   This is the first station: what was SAID, and WHEN, nothing else.  No summarising here; the
+#   later phases (tr2sm, tr3rm) cite these lines by their time stamps, and every claim upstream
+#   must resolve back to a line here (two readers: the time stamp and the words).
+#
+# usage: tr1qt AUDIO... [--out DIR] [--model small.en] [--prompt-file F]
+#        tr1qt AUDIO... --work [--slice 300] [--budget SECONDS]   resumable: see WORK below
+#        tr1qt --prove-red
+#   writes DIR/<stem>/QUOTES.tsv   start_s<TAB>end_s<TAB>hh:mm:ss<TAB>text   (one row per segment)
+#          DIR/<stem>/QUOTES.md    the same, readable: "[hh:mm:ss] text", with a header naming the
+#                                  source sha256, model, and the words it was primed with
+#          DIR/<stem>/PROVENANCE   key<TAB>value rows: source, sha256, duration, model, tool sha256
+#   WORK     --work transcribes in slices of --slice seconds (default 300) into DIR/<stem>/.slices/,
+#            skips slices already done, and after --budget seconds of work stops with exit 3 ("more
+#            to do: run the same command again").  When every slice is done it writes the three files
+#            and removes nothing (the slices stay as the receipt).  Born 2026-10-10: the cloud
+#            workspace restarted under a long run, and the device shell ends every job at 180 s.
+#            LIMIT: a word spoken across a slice boundary may be cut or doubled.
+#   MUST     reads audio only; never writes beside the source; refuses to overwrite an existing
+#            QUOTES.tsv (a second run lands as <stem>-2); records the source sha256 so a later
+#            phase can prove which recording it quotes.
+#   JOURNEY  the model (small.en), the priming words, VAD on, beam 1: one day's reading of speed vs
+#            accuracy on this host (measured 5.4x realtime on 2 cores).  Mine; change on a case.
+#   LIMIT    machine transcription: no speakers (no diarisation), names misheard ("clod" for
+#            Claude), cross-talk dropped.  Every QUOTES.md says so at the top.
+import hashlib, os, subprocess, sys, time
+
+PRIME = ("Corwin, Bryant, Bridget, Claude, Mentat, Alfred, C4, Cowork, ghostwheel, Tavern, "
+         "Vibrobeast, colophon, garden, GPL, LGPL, Creative Commons, SPDX, Emacs, GNU, FSF.")
+
+def sha256(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+def hms(s):
+    s = int(s); return "%02d:%02d:%02d" % (s // 3600, s % 3600 // 60, s % 60)
+
+def decode(p):
+    import numpy as np
+    r = subprocess.run(["ffmpeg", "-v", "error", "-i", p, "-f", "f32le", "-ac", "1", "-ar", "16000", "-"],
+                       capture_output=True, check=True)
+    return np.frombuffer(r.stdout, np.float32)
+
+def outdir(base, stem):
+    d = os.path.join(base, stem); n = 2
+    while os.path.exists(os.path.join(d, "QUOTES.tsv")):
+        d = os.path.join(base, "%s-%d" % (stem, n)); n += 1
+    os.makedirs(d, exist_ok=True); return d
+
+def clean(t):
+    return " ".join(t.replace("\t", " ").split())
+
+def write(d, src, digest, dur, model, prime, rows):
+    with open(os.path.join(d, "QUOTES.tsv"), "w") as f:
+        for a, b, t in rows:
+            f.write("%.2f\t%.2f\t%s\t%s\n" % (a, b, hms(a), t))
+    with open(os.path.join(d, "QUOTES.md"), "w") as f:
+        f.write("# QUOTES: %s\n\n" % os.path.basename(src))
+        f.write("Phase 1 of 3 (quotes by time). Machine transcription by `tr1qt`, model `%s`.\n" % model)
+        f.write("No speakers are marked; names may be misheard; cross-talk is dropped. ")
+        f.write("Cite a line by its time stamp; check the recording before quoting anyone.\n\n")
+        f.write("- source sha256: `%s`\n- duration: %s\n- primed with: %s\n\n" % (digest, hms(dur), prime))
+        for a, b, t in rows:
+            f.write("[%s] %s\n" % (hms(a), t))
+    me = os.path.abspath(__file__)
+    with open(os.path.join(d, "PROVENANCE"), "w") as f:
+        for k, v in (("source", os.path.basename(src)), ("sha256", digest), ("duration_s", "%.1f" % dur),
+                     ("model", model), ("tool", "tr1qt"), ("tool_sha256", sha256(me)),
+                     ("made_utc", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())), ("prime", prime)):
+            f.write("%s\t%s\n" % (k, v))
+
+def run_work(paths, out, model, prime, slice_s, budget):
+    from faster_whisper import WhisperModel
+    t0 = time.time(); m = None
+    for p in paths:
+        stem = os.path.splitext(os.path.basename(p))[0]
+        d = os.path.join(out, stem); sd = os.path.join(d, ".slices")
+        if os.path.exists(os.path.join(d, "QUOTES.tsv")):
+            print("tr1qt: %s already done" % stem); continue
+        os.makedirs(sd, exist_ok=True)
+        a = decode(p); dur = len(a) / 16000.0
+        n = int(dur // slice_s) + (1 if dur % slice_s else 0)
+        for i in range(n):
+            f = os.path.join(sd, "%04d.tsv" % i)
+            if os.path.exists(f): continue
+            if budget and time.time() - t0 > budget:
+                print("tr1qt: more to do (%s slice %d of %d): run the same command again" % (stem, i, n), flush=True)
+                sys.exit(3)
+            if m is None: m = WhisperModel(model, device="cpu", compute_type="int8")
+            off = i * slice_s
+            segs, _ = m.transcribe(a[int(off * 16000):int((off + slice_s) * 16000)], vad_filter=True,
+                                   beam_size=1, initial_prompt=prime, condition_on_previous_text=False)
+            rows = ["%.2f\t%.2f\t%s\n" % (s.start + off, s.end + off, clean(s.text)) for s in segs if clean(s.text)]
+            with open(f + ".part", "w") as g: g.writelines(rows)
+            os.replace(f + ".part", f)
+            print("tr1qt: %s slice %d/%d done" % (stem, i + 1, n), flush=True)
+        rows = []
+        for i in range(n):
+            for ln in open(os.path.join(sd, "%04d.tsv" % i)):
+                a1, b1, t = ln.rstrip("\n").split("\t", 2); rows.append((float(a1), float(b1), t))
+        write(d, p, sha256(p), dur, model + " (work, %ds slices)" % slice_s, prime, rows)
+        print("tr1qt: %s -> %s (%d lines, %s)" % (os.path.basename(p), d, len(rows), hms(dur)), flush=True)
+
+def run(paths, out, model, prime):
+    from faster_whisper import WhisperModel
+    m = WhisperModel(model, device="cpu", compute_type="int8")
+    for p in paths:
+        a = decode(p); dur = len(a) / 16000.0
+        segs, _ = m.transcribe(a, vad_filter=True, beam_size=1, initial_prompt=prime,
+                               condition_on_previous_text=False)
+        rows = [(s.start, s.end, clean(s.text)) for s in segs if clean(s.text)]
+        d = outdir(out, os.path.splitext(os.path.basename(p))[0])
+        write(d, p, sha256(p), dur, model, prime, rows)
+        print("tr1qt: %s -> %s (%d lines, %s)" % (os.path.basename(p), d, len(rows), hms(dur)), flush=True)
+
+def prove_red():
+    import tempfile
+    ok = fired = 0; t = tempfile.mkdtemp()
+    # plant 1: a second write must not overwrite the first
+    d1 = outdir(t, "x"); write(d1, "x.mp3", "0" * 64, 1, "m", "p", [(0, 1, "a")])
+    d2 = outdir(t, "x"); fired += d2 != d1; ok += 1
+    # plant 2: a tab inside spoken text must not break the TSV into extra columns
+    write(d2, "x.mp3", "0" * 64, 1, "m", "p", [(0, 1, clean("a\tb"))])
+    cols = open(os.path.join(d2, "QUOTES.tsv")).read().rstrip("\n").split("\t")
+    fired += len(cols) == 4; ok += 1
+    # plant 3: hh:mm:ss past an hour
+    fired += hms(3725) == "01:02:05"; ok += 1
+    # plant 4: the readable file must carry the limit sentence
+    fired += "No speakers are marked" in open(os.path.join(d2, "QUOTES.md")).read(); ok += 1
+    # plant 5: a half-written slice (.part) is not taken as done
+    sd = os.path.join(t, "y", ".slices"); os.makedirs(sd); open(os.path.join(sd, "0000.tsv.part"), "w").write("x")
+    fired += not os.path.exists(os.path.join(sd, "0000.tsv")); ok += 1
+    print("tr1qt --prove-red: %d/%d planted cases read as planted" % (fired, ok))
+    return 0 if fired == ok else 1
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    if a[:1] == ["--prove-red"]: sys.exit(prove_red())
+    out, model, prime, paths, work, slice_s, budget = ".", "small.en", PRIME, [], False, 300, 0
+    i = 0
+    while i < len(a):
+        if a[i] == "--out": out = a[i + 1]; i += 2
+        elif a[i] == "--model": model = a[i + 1]; i += 2
+        elif a[i] == "--prompt-file": prime = open(a[i + 1]).read().strip(); i += 2
+        elif a[i] == "--work": work = True; i += 1
+        elif a[i] == "--slice": slice_s = int(a[i + 1]); i += 2
+        elif a[i] == "--budget": budget = float(a[i + 1]); i += 2
+        else: paths.append(a[i]); i += 1
+    if not paths: print(__doc__ or "usage: tr1qt AUDIO... [--out DIR]"); sys.exit(2)
+    if work: run_work(paths, out, model, prime, slice_s, budget)
+    else: run(paths, out, model, prime)

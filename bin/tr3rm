@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+# tr3rm -- TRANSCRIPT 3 RESULT MODEL: phase three of three.  Subject stations in, one result model
+#          out, read SEAM / PIN / SEMAPHORE, every item citing the quote it rests on.
+#   Copyright 2026 Corwin Brust <corwin@bru.st> and Contributors.  Authored by Mentat (for Corwin).
+#   SPDX-License-Identifier: GPL-3.0-or-later OR LGPL-3.0-or-later
+#   This program is free software: you can redistribute it and/or modify it under the terms of the
+#   GNU General Public License (or the GNU Lesser General Public License), version 3 or later.
+#
+# WHY: his ask, 2026-10-10: "... summarizing to present from each ideational level models PoV as we
+#   work these in SEAM/PIN/SEMAPHORE style -> result model".  Three levels, each shown from its own
+#   point of view: the QUOTES (what was said, when), the SUBJECTS (what it was about), the RESULT
+#   (what it came to).  The result never says anything a cited quote does not carry.
+#     PIN        something settled:  a line that agrees, confirms, decides
+#     SEAM       something in tension: a line that objects, doubts, corrects
+#     SEMAPHORE  something raised for later: a line that asks, owes, defers
+#   These are CUE readings (words in the line), not understanding: the reader checks the line.
+#
+# usage: tr3rm build SDIR QDIR... [--summaries FILE] [--title T]   writes SDIR/RESULT.md + RESULT.tsv
+#        tr3rm check SDIR QDIR...      every citation in SDIR resolves to its quote, verbatim; every
+#                                      quote is in exactly one subject; exit 1 on any fault
+#        tr3rm --prove-red
+#   --summaries FILE  slug<TAB>by<TAB>text rows (one per subject) from any summariser -- a local model
+#                     through llama-bridge, a person, Claude.  Shown under each subject with its "by",
+#                     never mixed into the cue readings.
+#   MUST     reads phase 1 and 2 outputs, writes only RESULT.md and RESULT.tsv in SDIR (a second build
+#            lands as RESULT-2.md); check reads only.
+#   JOURNEY  the cue lists below; one day's reading of how these speakers mark a decision.
+import os, re, sys
+
+CUES = {
+    "PIN": r"\b(agree[ds]?|agreed|confirm(ed|s)?|decided|settled|that works|go with|let'?s do|we will|we'll|"
+           r"sounds good|approved?|yes,? (that|exactly)|exactly|done|deal)\b",
+    "SEAM": r"\b(but|however|disagree|not sure|concern(ed)?|problem|wrong|mistake|pushback|push back|"
+            r"actually,? no|no,? no|doesn'?t|isn'?t right|instead|careful)\b",
+    "SEMAPHORE": r"(\?\s*$|\b(need to|have to|should|todo|to do|later|next time|follow up|remind|owe[ds]?|"
+                 r"we'?ll see|ask (him|her|them|bryant|corwin)|journal|write (it|that) down|open question)\b)",
+}
+CRE = {k: re.compile(v, re.I) for k, v in CUES.items()}
+CITE = re.compile(r"\[([^\]\s]+) (\d\d:\d\d:\d\d)\] (.*)")
+
+def hms(s):
+    s = int(float(s)); return "%02d:%02d:%02d" % (s // 3600, s % 3600 // 60, s % 60)
+
+def quotes(qdirs):
+    q = {}
+    for d in qdirs:
+        stem = os.path.basename(os.path.normpath(d))
+        for ln in open(os.path.join(d, "QUOTES.tsv"), encoding="utf-8"):
+            p = ln.rstrip("\n").split("\t")
+            if len(p) == 4: q["%s@%s" % (stem, p[0])] = (stem, p[2], p[3])
+    return q
+
+def subjects(sdir):
+    out = []
+    for ln in open(os.path.join(sdir, "SUBJECTS.tsv"), encoding="utf-8"):
+        p = ln.rstrip("\n").split("\t")
+        out.append({"slug": p[0], "kind": p[1], "title": p[2], "first": p[3], "n": int(p[4]), "spans": int(p[5])})
+    return out
+
+def links(sdir):
+    return [tuple(l.rstrip("\n").split("\t")) for l in open(os.path.join(sdir, "LINKS.tsv"), encoding="utf-8")]
+
+def build(sdir, qdirs, summaries, title):
+    Q, S, L = quotes(qdirs), subjects(sdir), links(sdir)
+    summ = {}
+    if summaries:
+        for ln in open(summaries, encoding="utf-8"):
+            p = ln.rstrip("\n").split("\t", 2)
+            if len(p) == 3: summ[p[0]] = (p[1], p[2])
+    by_subj = {}
+    for k, s in L: by_subj.setdefault(s, []).append(k)
+    items = []   # (kind, slug, key)
+    for s in S:
+        for k in by_subj.get(s["slug"], []):
+            for kind, rx in CRE.items():
+                if rx.search(Q[k][2]): items.append((kind, s["slug"], k))
+    name, n = "RESULT", 2
+    while os.path.exists(os.path.join(sdir, name + ".md")): name = "RESULT-%d" % n; n += 1
+    cite = lambda k: "[%s %s] %s" % Q[k]
+    dur = {}
+    for k, (stem, t, _) in Q.items(): dur[stem] = max(dur.get(stem, "00:00:00"), t)
+    with open(os.path.join(sdir, name + ".tsv"), "w") as f:
+        for kind, s, k in items: f.write("%s\t%s\t%s\t%s\n" % (kind, s, k, Q[k][2]))
+    with open(os.path.join(sdir, name + ".md"), "w") as f:
+        f.write("# Result model: %s\n\n" % title)
+        f.write("Phase 3 of 3, made by `tr3rm`. It rests on phase 2 ([INDEX](INDEX.md)) and phase 1 (each recording's QUOTES.md). ")
+        f.write("PIN / SEAM / SEMAPHORE are cue readings of the words in a line, not judgements: check the line, and the recording, before relying on one.\n\n")
+        f.write("The words as C4 holds them (`g/TAXONOMY/seam`, `pin`, `semaphore`): a SEAM is where two readings of one truth can split; a PIN fixes a crossing, a decision that can be re-made; a SEMAPHORE is a signal read at a gate, cheap to raise, and lowering it is the work. ")
+        f.write("Corwin, recorded 2026-09-19: \"a file that records the seams is called a semaphore, and entries in that file are called pins.\" So each seam below shows the first pin said after it in the same subject (\"held by\"), or none (\"still raised\").\n\n")
+        f.write("## Level 1, the quotes: what was said, and when\n\n")
+        for stem in sorted(dur): f.write("- `%s`: %d lines, last at %s\n" % (stem, sum(1 for v in Q.values() if v[0] == stem), dur[stem]))
+        f.write("\n## Level 2, the subjects: what it was about\n\n")
+        for i, s in enumerate(S, 1):
+            f.write("%d. [%s](%s.md): %s, %d lines in %d span(s), first at %s\n" % (
+                i, s["title"], s["slug"], s["kind"].lower(), s["n"], s["spans"], cite(s["first"]).split("]")[0] + "]"))
+        f.write("\n## Level 3, the result: what it came to\n\n")
+        counts = {k: sum(1 for it in items if it[0] == k) for k in CUES}
+        f.write("%d pins, %d seams, %d semaphores across %d subjects.\n\n" % (counts["PIN"], counts["SEAM"], counts["SEMAPHORE"], len(S)))
+        for s in S:
+            mine = [it for it in items if it[1] == s["slug"]]
+            f.write("### [%s](%s.md)\n\n" % (s["title"], s["slug"]))
+            if s["slug"] in summ:
+                f.write("*Summary by %s (a reading, not a quote):* %s\n\n" % summ[s["slug"]])
+            if not mine: f.write("No cue lines. Read the subject itself.\n\n"); continue
+            order_k = by_subj.get(s["slug"], [])
+            pins = [it[2] for it in mine if it[0] == "PIN"]
+            for kind in ("SEAM", "PIN", "SEMAPHORE"):
+                ks = [it[2] for it in mine if it[0] == kind]
+                if ks:
+                    f.write("**%s**\n\n" % kind)
+                    for k in ks:
+                        f.write("- %s\n" % cite(k))
+                        if kind == "SEAM":
+                            after = [p for p in pins if order_k.index(p) > order_k.index(k)]
+                            f.write("  - held by: %s\n" % (cite(after[0]) if after else "none; still raised"))
+                    f.write("\n")
+    print("tr3rm: %s/%s.md: %d subjects, %s" % (sdir, name, len(S), ", ".join("%d %s" % (v, k.lower()) for k, v in counts.items())))
+
+def check(sdir, qdirs):
+    Q, S, L = quotes(qdirs), subjects(sdir), links(sdir)
+    faults = []
+    keys = [k for k, _ in L]
+    if sorted(keys) != sorted(Q): faults.append("LINKS.tsv does not hold every quote exactly once (%d links, %d quotes)" % (len(keys), len(Q)))
+    slugs = {s["slug"] for s in S}
+    for k, s in L:
+        if s not in slugs: faults.append("LINKS row %s names missing subject %s" % (k, s))
+    bytext = {}
+    for k, (stem, t, txt) in Q.items(): bytext.setdefault((stem, t), set()).add(txt)
+    n = 0
+    for fn in sorted(os.listdir(sdir)):
+        if not fn.endswith(".md"): continue
+        for i, ln in enumerate(open(os.path.join(sdir, fn), encoding="utf-8"), 1):
+            for m in re.finditer(r"\[([^\]\s]+) (\d\d:\d\d:\d\d)\]", ln):
+                n += 1
+                if m.groups() not in bytext:
+                    faults.append("%s:%d cites [%s %s], which is not a quote" % (fn, i, m.group(1), m.group(2)))
+            m = CITE.match(ln.rstrip("\n")[2:] if ln.startswith("- ") else ln.rstrip("\n"))
+            if m and m.group(3).strip() and (m.group(1), m.group(2)) in bytext and not ln.startswith("#") \
+                    and m.group(3).strip() not in bytext[(m.group(1), m.group(2))]:
+                faults.append("%s:%d cites [%s %s] but the words differ from QUOTES" % (fn, i, m.group(1), m.group(2)))
+    for f in faults: print("FAULT", f)
+    print("tr3rm check: %d citations read, %d quotes, %d subjects, %d fault(s)" % (n, len(Q), len(S), len(faults)))
+    return 1 if faults else 0
+
+def prove_red():
+    import tempfile, shutil, subprocess
+    t = tempfile.mkdtemp(); fired = n = 0
+    here = os.path.dirname(os.path.abspath(__file__))
+    q = os.path.join(t, "rec"); os.makedirs(q)
+    lines = ["we agreed on the terms", "but I am not sure about the fallback", "should we ask Bryant later?", "the weather"]
+    with open(os.path.join(q, "QUOTES.tsv"), "w") as f:
+        for i, s in enumerate(lines): f.write("%.2f\t%.2f\t%s\t%s\n" % (i * 10, i * 10 + 5, hms(i * 10), s))
+    sd = os.path.join(t, "s")
+    tr2 = os.path.join(here, "tr2sm")
+    subprocess.run([sys.executable, tr2, "build", q, "--out", sd], check=True, capture_output=True)
+    build(sd, [q], None, "plant")
+    R = [l.split("\t")[0:3] for l in open(os.path.join(sd, "RESULT.tsv"))]
+    kinds = {(k, key) for k, _, key in R}
+    n += 1; fired += ("PIN", "rec@0.00") in kinds
+    n += 1; fired += ("SEAM", "rec@10.00") in kinds
+    n += 1; fired += ("SEMAPHORE", "rec@20.00") in kinds
+    n += 1; fired += not any(key == "rec@30.00" for _, key in kinds)   # no cue, no item
+    n += 1; fired += check(sd, [q]) == 0
+    txt = open(os.path.join(sd, "RESULT.md")).read()
+    n += 1; fired += "- [rec 00:00:10] but I am not sure about the fallback\n  - held by: none; still raised" in txt
+    # plant: alter a cited word in RESULT.md -> check must go red
+    p = os.path.join(sd, "RESULT.md"); open(p, "a").write("- [rec 00:00:00] we agreed on everything\n")
+    n += 1; fired += check(sd, [q]) == 1
+    # plant: cite a time that is no quote
+    open(p, "a").write("- [rec 00:09:59] ghost\n")
+    n += 1; fired += check(sd, [q]) == 1
+    shutil.rmtree(t)
+    print("tr3rm --prove-red: %d/%d planted cases read as planted" % (fired, n))
+    return 0 if fired == n else 1
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    if not a: print("usage: tr3rm build|check SDIR QDIR... [--summaries F] [--title T] | --prove-red"); sys.exit(2)
+    if a[0] == "--prove-red": sys.exit(prove_red())
+    verb, a = a[0], a[1:]
+    summ, title, rest, i = None, "conversation", [], 0
+    while i < len(a):
+        if a[i] == "--summaries": summ = a[i + 1]; i += 2
+        elif a[i] == "--title": title = a[i + 1]; i += 2
+        else: rest.append(a[i]); i += 1
+    sdir, qdirs = rest[0], rest[1:]
+    if verb == "build": build(sdir, qdirs, summ, title)
+    elif verb == "check": sys.exit(check(sdir, qdirs))
+    else: sys.exit(2)
