@@ -16,11 +16,12 @@ Recorded talk in three layers, each citing the one below:
 
 | part | what |
 |---|---|
-| =bin/tr1qt= | audio to QUOTES (faster-whisper small.en; =--work= resumes by slice) |
+| =bin/tr1qt= | audio to QUOTES (faster-whisper small.en; =--work= resumes by slice; =--tail 30m= or =--from/--to= read one stretch of a long recording) |
 | =bin/tr2sm= | QUOTES to subjects: anchored on a document's sections, or free talk split where it changes; 20 s windows, measured |
 | =bin/tr3rm= | subjects to RESULT: each seam with the pin that holds it, or still raised; =check= proves every citation |
 | =bin/tr2vs= | two readers of one recording, counted |
 | =tests/tr-spec.sh= | the second reader, sh + awk |
+| =tests/tr-window.pl= | the third reader, Perl: names a citation can carry, stamps inside the window, the clock from the name, the kept hash |
 | =d/transcripts/SET/= | =q1/= quotes, =s2/= subjects and result, =README.md=, sometimes =READING.md=, =VERSUS.md=, =SWEEP.tsv= |
 
 * Make a set
@@ -29,6 +30,7 @@ Phase 1 needs python3 with faster-whisper. Phases 2 and 3 need only python3. Run
 
 #+begin_src sh
 python3 bin/tr1qt AUDIO... --out d/transcripts/SET/q1 --work
+python3 bin/tr1qt LONG.mp4 --tail 30m --out d/transcripts/SET/q1 --work --budget 90   # one stretch; run again until done
 python3 bin/tr2sm sweep d/transcripts/SET/q1/* --anchor ANCHOR.md
 python3 bin/tr2sm build d/transcripts/SET/q1/* --anchor ANCHOR.md --out d/transcripts/SET/s2
 python3 bin/tr3rm build d/transcripts/SET/s2 d/transcripts/SET/q1/* --summaries d/transcripts/SET/SUMMARIES.tsv --title "..."
@@ -46,6 +48,8 @@ for s in d/transcripts/*/; do
 done
 for t in tr1qt tr2sm tr3rm tr2vs; do python3 bin/$t --prove-red | tail -1; done
 sh tests/tr-spec.sh --prove-red
+perl tests/tr-window.pl --prove-red
+perl tests/tr-window.pl d/transcripts/*/q1/*/
 #+end_src
 
 * Rebuild on change

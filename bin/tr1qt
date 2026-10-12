@@ -12,6 +12,7 @@
 #
 # usage: tr1qt AUDIO... [--out DIR] [--model small.en] [--prompt-file F]
 #        tr1qt AUDIO... --work [--slice 300] [--budget SECONDS]   resumable: see WORK below
+#        tr1qt AUDIO... [--from T] [--to T | --tail D]             one stretch of a long recording: WINDOW
 #        tr1qt --prove-red
 #   writes DIR/<stem>/QUOTES.tsv   start_s<TAB>end_s<TAB>hh:mm:ss<TAB>text   (one row per segment)
 #          DIR/<stem>/QUOTES.md    the same, readable: "[hh:mm:ss] text", with a header naming the
@@ -23,6 +24,22 @@
 #            and removes nothing (the slices stay as the receipt).  Born 2026-10-10: the cloud
 #            workspace restarted under a long run, and the device shell ends every job at 180 s.
 #            LIMIT: a word spoken across a slice boundary may be cut or doubled.
+#            The source sha256 is taken once and kept in DIR/<stem>/.sha256 beside the size and mtime
+#            it was taken at (77 s for a 7.5 GB file on the device shell, 2026-10-11); a call whose
+#            budget the hash used up stops there, and the next call goes on to the slices.
+#   WINDOW   --from/--to (or --tail: the last D of the recording) decode only that stretch.  ffmpeg
+#            seeks, so an 18-hour screen recording never sits whole in memory (it would need 4 GB).
+#            T and D read as seconds, mm:ss, hh:mm:ss, or 90s / 30m / 1h.  Stamps in QUOTES stay in
+#            the recording's own clock: a stamp is found again by seeking the same file to it.  The
+#            folder is <stem>_tail30m (or <stem>_<from>-<to> as hhmmss); PROVENANCE says the window.
+#            Born 2026-10-11: his ask named "the last 30m" of a 7.5 GB, 18 h OBS recording.
+#   NAMES    a stem keeps letters, digits and . _ + - ; anything else becomes _ .  OBS names a file
+#            "2026-10-11 18-33-17.mp4", and a citation "[stem hh:mm:ss]" ends at its first space
+#            (tr3rm CITE, tests/tr-spec.sh S3), so that space broke every citation.  Born 2026-10-11.
+#   CLOCK    a name that reads as a date and time (OBS "YYYY-MM-DD HH-MM-SS", or YYYY_MM_DD_HH_MM_SS)
+#            gives the wall clock at the recording's 00:00:00: PROVENANCE clock_start, and a line in
+#            QUOTES.md, so two recordings of one evening line up.  The name is the only witness: a
+#            renamed file gives a wrong clock, and QUOTES.md says where the clock came from.
 #   MUST     reads audio only; never writes beside the source; refuses to overwrite an existing
 #            QUOTES.tsv (a second run lands as <stem>-2); records the source sha256 so a later
 #            phase can prove which recording it quotes.
@@ -30,7 +47,7 @@
 #            accuracy on this host (measured 5.4x realtime on 2 cores).  Mine; change on a case.
 #   LIMIT    machine transcription: no speakers (no diarisation), names misheard ("clod" for
 #            Claude), cross-talk dropped.  Every QUOTES.md says so at the top.
-import hashlib, os, subprocess, sys, time
+import hashlib, os, re, subprocess, sys, time
 
 PRIME = ("Corwin, Bryant, Bridget, Claude, Mentat, Alfred, C4, Cowork, ghostwheel, Tavern, "
          "Vibrobeast, colophon, garden, GPL, LGPL, Creative Commons, SPDX, Emacs, GNU, FSF.")
@@ -45,9 +62,59 @@ def sha256(p):
 def hms(s):
     s = int(s); return "%02d:%02d:%02d" % (s // 3600, s % 3600 // 60, s % 60)
 
-def decode(p):
+def secs(t):
+    # seconds from 90, 90.5, 2:30, 01:02:05, 90s, 30m, 1h
+    t = str(t).strip().lower()
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([smh])", t)
+    if m: return float(m.group(1)) * {"s": 1, "m": 60, "h": 3600}[m.group(2)]
+    try:
+        v = 0.0
+        for part in t.split(":"): v = v * 60 + float(part)
+        return v
+    except ValueError:
+        sys.exit("tr1qt: cannot read %r as a time (try 90, 2:30, 01:02:05, 90s, 30m or 1h)" % t)
+
+def stem_of(p, tag=""):
+    return re.sub(r"[^A-Za-z0-9._+-]+", "_", os.path.splitext(os.path.basename(p))[0] + tag)
+
+CLOCK = re.compile(r"(\d{4})[-_](\d\d)[-_](\d\d)[ _T-](\d\d)[-_:](\d\d)[-_:](\d\d)")
+
+def clock_of(p):
+    m = CLOCK.search(os.path.basename(p))
+    return "%s-%s-%sT%s:%s:%s" % m.groups() if m else None
+
+def duration(p):
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", p],
+                       capture_output=True, text=True, check=True)
+    return float(r.stdout.strip())
+
+def window_of(dur, a=None, b=None, tail=None):
+    # (from_s, to_s, folder tag) in the recording's own clock
+    if tail is not None:
+        if a is not None or b is not None: sys.exit("tr1qt: --tail stands alone; use --from/--to for any other stretch")
+        return max(0.0, dur - secs(tail)), dur, "_tail" + re.sub(r"[^A-Za-z0-9.]+", "", str(tail))
+    a = secs(a) if a is not None else 0.0
+    b = min(secs(b), dur) if b is not None else dur
+    if not a < b: sys.exit("tr1qt: the window is empty (from %s to %s)" % (hms(a), hms(b)))
+    return a, b, "_%s-%s" % (hms(a).replace(":", ""), hms(b).replace(":", ""))
+
+def place(segs, off):
+    # (start, end, text) of a decoded stretch -> rows in the recording's own clock; blank lines drop
+    return [(s0 + off, s1 + off, clean(t)) for s0, s1, t in segs if clean(t)]
+
+def sha256_cached(p, d):
+    st = os.stat(p); key = "%d\t%d" % (st.st_size, int(st.st_mtime)); f = os.path.join(d, ".sha256")
+    if os.path.exists(f):
+        k = open(f).read().rstrip("\n").split("\t")
+        if len(k) == 3 and "%s\t%s" % (k[0], k[1]) == key: return k[2]
+    h = sha256(p)
+    with open(f + ".part", "w") as g: g.write("%s\t%s\n" % (key, h))
+    os.replace(f + ".part", f); return h
+
+def decode(p, a=0.0, b=None):
     import numpy as np
-    r = subprocess.run(["ffmpeg", "-v", "error", "-i", p, "-f", "f32le", "-ac", "1", "-ar", "16000", "-"],
+    seek = (["-ss", "%.3f" % a] if a else []) + (["-t", "%.3f" % (b - a)] if b is not None else [])
+    r = subprocess.run(["ffmpeg", "-v", "error"] + seek + ["-i", p, "-f", "f32le", "-ac", "1", "-ar", "16000", "-"],
                        capture_output=True, check=True)
     return np.frombuffer(r.stdout, np.float32)
 
@@ -60,7 +127,8 @@ def outdir(base, stem):
 def clean(t):
     return " ".join(t.replace("\t", " ").split())
 
-def write(d, src, digest, dur, model, prime, rows):
+def write(d, src, digest, dur, model, prime, rows, win=None):
+    ck = clock_of(src)
     with open(os.path.join(d, "QUOTES.tsv"), "w") as f:
         for a, b, t in rows:
             f.write("%.2f\t%.2f\t%s\t%s\n" % (a, b, hms(a), t))
@@ -69,7 +137,10 @@ def write(d, src, digest, dur, model, prime, rows):
         f.write("Phase 1 of 3 (quotes by time). Machine transcription by `tr1qt`, model `%s`.\n" % model)
         f.write("No speakers are marked; names may be misheard; cross-talk is dropped. ")
         f.write("Cite a line by its time stamp; check the recording before quoting anyone.\n\n")
-        f.write("- source sha256: `%s`\n- duration: %s\n- primed with: %s\n\n" % (digest, hms(dur), prime))
+        f.write("- source sha256: `%s`\n- duration: %s\n" % (digest, hms(dur)))
+        if win: f.write("- window: %s to %s; stamps are in the recording's own clock\n" % (hms(win[0]), hms(win[1])))
+        if ck: f.write("- wall clock at 00:00:00: %s (read from the file name)\n" % ck.replace("T", " "))
+        f.write("- primed with: %s\n\n" % prime)
         for a, b, t in rows:
             f.write("[%s] %s\n" % (hms(a), t))
     me = os.path.abspath(__file__)
@@ -78,18 +149,27 @@ def write(d, src, digest, dur, model, prime, rows):
                      ("model", model), ("tool", "tr1qt"), ("tool_sha256", sha256(me)),
                      ("made_utc", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())), ("prime", prime)):
             f.write("%s\t%s\n" % (k, v))
+        if win: f.write("window_s\t%.2f-%.2f\n" % (win[0], win[1]))
+        if ck: f.write("clock_start\t%s\n" % ck)
 
-def run_work(paths, out, model, prime, slice_s, budget):
+def run_work(paths, out, model, prime, slice_s, budget, win=(None, None, None)):
     from faster_whisper import WhisperModel
-    t0 = time.time(); m = None
+    t0 = time.time(); m = None; whole = win == (None, None, None)
     for p in paths:
-        stem = os.path.splitext(os.path.basename(p))[0]
+        src_dur = None if whole else duration(p)
+        w0, w1, tag = (0.0, None, "") if whole else window_of(src_dur, *win)
+        stem = stem_of(p, tag)
         d = os.path.join(out, stem); sd = os.path.join(d, ".slices")
         if os.path.exists(os.path.join(d, "QUOTES.tsv")):
             print("tr1qt: %s already done" % stem); continue
         os.makedirs(sd, exist_ok=True)
-        a = decode(p); dur = len(a) / 16000.0
-        n = int(dur // slice_s) + (1 if dur % slice_s else 0)
+        digest = sha256_cached(p, d)
+        if budget and time.time() - t0 > budget:
+            print("tr1qt: more to do (%s hashed; the slices are next): run the same command again" % stem, flush=True)
+            sys.exit(3)
+        a = decode(p, w0, w1); span = len(a) / 16000.0
+        dur = span if whole else src_dur
+        n = int(span // slice_s) + (1 if span % slice_s else 0)
         for i in range(n):
             f = os.path.join(sd, "%04d.tsv" % i)
             if os.path.exists(f): continue
@@ -100,7 +180,7 @@ def run_work(paths, out, model, prime, slice_s, budget):
             off = i * slice_s
             segs, _ = m.transcribe(a[int(off * 16000):int((off + slice_s) * 16000)], vad_filter=True,
                                    beam_size=1, initial_prompt=prime, condition_on_previous_text=False)
-            rows = ["%.2f\t%.2f\t%s\n" % (s.start + off, s.end + off, clean(s.text)) for s in segs if clean(s.text)]
+            rows = ["%.2f\t%.2f\t%s\n" % r for r in place([(s.start, s.end, s.text) for s in segs], w0 + off)]
             with open(f + ".part", "w") as g: g.writelines(rows)
             os.replace(f + ".part", f)
             print("tr1qt: %s slice %d/%d done" % (stem, i + 1, n), flush=True)
@@ -108,19 +188,21 @@ def run_work(paths, out, model, prime, slice_s, budget):
         for i in range(n):
             for ln in open(os.path.join(sd, "%04d.tsv" % i)):
                 a1, b1, t = ln.rstrip("\n").split("\t", 2); rows.append((float(a1), float(b1), t))
-        write(d, p, sha256(p), dur, model + " (work, %ds slices)" % slice_s, prime, rows)
+        write(d, p, digest, dur, model + " (work, %ds slices)" % slice_s, prime, rows, None if whole else (w0, w1))
         print("tr1qt: %s -> %s (%d lines, %s)" % (os.path.basename(p), d, len(rows), hms(dur)), flush=True)
 
-def run(paths, out, model, prime):
+def run(paths, out, model, prime, win=(None, None, None)):
     from faster_whisper import WhisperModel
-    m = WhisperModel(model, device="cpu", compute_type="int8")
+    m = WhisperModel(model, device="cpu", compute_type="int8"); whole = win == (None, None, None)
     for p in paths:
-        a = decode(p); dur = len(a) / 16000.0
+        src_dur = None if whole else duration(p)
+        w0, w1, tag = (0.0, None, "") if whole else window_of(src_dur, *win)
+        a = decode(p, w0, w1); dur = len(a) / 16000.0 if whole else src_dur
         segs, _ = m.transcribe(a, vad_filter=True, beam_size=1, initial_prompt=prime,
                                condition_on_previous_text=False)
-        rows = [(s.start, s.end, clean(s.text)) for s in segs if clean(s.text)]
-        d = outdir(out, os.path.splitext(os.path.basename(p))[0])
-        write(d, p, sha256(p), dur, model, prime, rows)
+        rows = place([(s.start, s.end, s.text) for s in segs], w0)
+        d = outdir(out, stem_of(p, tag))
+        write(d, p, sha256(p), dur, model, prime, rows, None if whole else (w0, w1))
         print("tr1qt: %s -> %s (%d lines, %s)" % (os.path.basename(p), d, len(rows), hms(dur)), flush=True)
 
 def prove_red():
@@ -140,6 +222,29 @@ def prove_red():
     # plant 5: a half-written slice (.part) is not taken as done
     sd = os.path.join(t, "y", ".slices"); os.makedirs(sd); open(os.path.join(sd, "0000.tsv.part"), "w").write("x")
     fired += not os.path.exists(os.path.join(sd, "0000.tsv")); ok += 1
+    # plant 6: an OBS name (a space in it) gives a stem that a citation can carry (tr3rm's CITE)
+    st = stem_of("/x/2026-10-11 18-33-17.mp4"); cite = re.compile(r"\[([^\]\s]+) (\d\d:\d\d:\d\d)\] (.*)")
+    fired += " " not in st and bool(cite.match("[%s 00:00:01] a" % st)); ok += 1
+    # plant 7: times read as seconds, in clock forms and unit forms alike
+    fired += (secs("30m"), secs("1:02:05"), secs("90"), secs("1h"), secs("2:30")) == (1800, 3725, 90, 3600, 150); ok += 1
+    # plant 8: the wall clock comes from a dated name, and from nothing else
+    fired += (clock_of("2026-10-11 18-33-17.mp4"), clock_of("2026_10_10_15_22_24.m4a"), clock_of("remodel.mp3")) == \
+             ("2026-10-11T18:33:17", "2026-10-10T15:22:24", None); ok += 1
+    # plant 9: stamps of a window stay in the recording's own clock; a blank line drops
+    fired += place([(0.5, 1.0, "a"), (2, 3, " \t")], 100) == [(100.5, 101.0, "a")]; ok += 1
+    # plant 10: the last 30m of an 18 h recording, and the folder named for it
+    w = window_of(65365.466, None, None, "30m")
+    fired += abs(w[0] - 63565.466) < 1e-6 and w[1] == 65365.466 and w[2] == "_tail30m"; ok += 1
+    # plant 11: an empty window is refused, not transcribed as nothing
+    try: window_of(100.0, "90", "80"); refused = False
+    except SystemExit: refused = True
+    fired += refused; ok += 1
+    # plant 12: a kept hash is used while size and mtime hold, and taken again once the file changes
+    src = os.path.join(t, "audio.bin"); open(src, "w").write("one"); cd = os.path.join(t, "cache"); os.makedirs(cd)
+    h1 = sha256_cached(src, cd); kf = os.path.join(cd, ".sha256")
+    kept = open(kf).read(); open(kf, "w").write(kept.replace(h1, "f" * 64))
+    h2 = sha256_cached(src, cd); open(src, "w").write("three"); h3 = sha256_cached(src, cd)
+    fired += h2 == "f" * 64 and h3 == sha256(src) and h3 != h1; ok += 1
     print("tr1qt --prove-red: %d/%d planted cases read as planted" % (fired, ok))
     return 0 if fired == ok else 1
 
@@ -147,6 +252,7 @@ if __name__ == "__main__":
     a = sys.argv[1:]
     if a[:1] == ["--prove-red"]: sys.exit(prove_red())
     out, model, prime, paths, work, slice_s, budget = ".", "small.en", PRIME, [], False, 300, 0
+    win = [None, None, None]
     i = 0
     while i < len(a):
         if a[i] == "--out": out = a[i + 1]; i += 2
@@ -155,7 +261,12 @@ if __name__ == "__main__":
         elif a[i] == "--work": work = True; i += 1
         elif a[i] == "--slice": slice_s = int(a[i + 1]); i += 2
         elif a[i] == "--budget": budget = float(a[i + 1]); i += 2
+        elif a[i] == "--from": win[0] = a[i + 1]; i += 2
+        elif a[i] == "--to": win[1] = a[i + 1]; i += 2
+        elif a[i] == "--tail": win[2] = a[i + 1]; i += 2
         else: paths.append(a[i]); i += 1
     if not paths: print(__doc__ or "usage: tr1qt AUDIO... [--out DIR]"); sys.exit(2)
-    if work: run_work(paths, out, model, prime, slice_s, budget)
-    else: run(paths, out, model, prime)
+    if win[2] is not None and (win[0] is not None or win[1] is not None):
+        sys.exit("tr1qt: --tail stands alone; use --from/--to for any other stretch")
+    if work: run_work(paths, out, model, prime, slice_s, budget, tuple(win))
+    else: run(paths, out, model, prime, tuple(win))

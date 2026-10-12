@@ -5,3 +5,4 @@ bin/tr3rm
 bin/tr2vs
 tests/tr-spec.sh
 d/transcripts/RECIPE.org
+tests/tr-window.pl

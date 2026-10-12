@@ -19,9 +19,11 @@
 #        tr3rm check SDIR QDIR...      every citation in SDIR resolves to its quote, verbatim; every
 #                                      quote is in exactly one subject; exit 1 on any fault
 #        tr3rm --prove-red
-#   --summaries FILE  slug<TAB>by<TAB>text rows (one per subject) from any summariser -- a local model
-#                     through llama-bridge, a person, Claude.  Shown under each subject with its "by",
-#                     never mixed into the cue readings.
+#   --summaries FILE  slug<TAB>by<TAB>text rows from any summariser -- a local model through llama-bridge,
+#                     a person, Claude.  Shown under each subject with its "by", never mixed into the cue
+#                     readings.  A subject may carry rows by several readers (2026-10-11: Claude and a
+#                     local qwen3:8b read the same subjects); each is shown, in file order, so where two
+#                     readings part is in plain view.  A row naming no subject is reported, not dropped.
 #   MUST     reads phase 1 and 2 outputs, writes only RESULT.md and RESULT.tsv in SDIR (a second build
 #            lands as RESULT-2.md); check reads only.
 #   JOURNEY  the cue lists below; one day's reading of how these speakers mark a decision.
@@ -66,7 +68,10 @@ def build(sdir, qdirs, summaries, title):
     if summaries:
         for ln in open(summaries, encoding="utf-8"):
             p = ln.rstrip("\n").split("\t", 2)
-            if len(p) == 3: summ[p[0]] = (p[1], p[2])
+            if len(p) == 3: summ.setdefault(p[0], []).append((p[1], p[2]))
+        known = {s["slug"] for s in S}
+        for slug in summ:
+            if slug not in known: print("tr3rm: a reading names no subject: %s (shown nowhere)" % slug)
     by_subj = {}
     for k, s in L: by_subj.setdefault(s, []).append(k)
     items = []   # (kind, slug, key)
@@ -99,8 +104,8 @@ def build(sdir, qdirs, summaries, title):
         for s in S:
             mine = [it for it in items if it[1] == s["slug"]]
             f.write("### [%s](%s.md)\n\n" % (s["title"], s["slug"]))
-            if s["slug"] in summ:
-                f.write("*Summary by %s (a reading, not a quote):* %s\n\n" % summ[s["slug"]])
+            for by, text in summ.get(s["slug"], []):
+                f.write("*Summary by %s (a reading, not a quote):* %s\n\n" % (by, text))
             if not mine: f.write("No cue lines. Read the subject itself.\n\n"); continue
             order_k = by_subj.get(s["slug"], [])
             pins = [it[2] for it in mine if it[0] == "PIN"]
@@ -169,6 +174,16 @@ def prove_red():
     # plant: cite a time that is no quote
     open(p, "a").write("- [rec 00:09:59] ghost\n")
     n += 1; fired += check(sd, [q]) == 1
+    # plant: two readers of one subject are both shown; a reading for no subject is reported
+    import io, contextlib
+    slug0 = subjects(sd)[0]["slug"]; sf = os.path.join(t, "summ.tsv")
+    open(sf, "w").write("%s\tReader A\tfirst reading\n%s\tReader B\tsecond reading\nno-such\tReader C\tlost\n" % (slug0, slug0))
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out): build(sd, [q], sf, "plant two")
+    txt2 = open(os.path.join(sd, "RESULT-2.md")).read()
+    n += 1; fired += "*Summary by Reader A (a reading, not a quote):* first reading" in txt2 and \
+                     "*Summary by Reader B (a reading, not a quote):* second reading" in txt2
+    n += 1; fired += "no-such" in out.getvalue() and "lost" not in txt2
     shutil.rmtree(t)
     print("tr3rm --prove-red: %d/%d planted cases read as planted" % (fired, n))
     return 0 if fired == n else 1
