@@ -17,6 +17,6 @@ jobs:
   second-reader:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build a fixture with the tools, read it green in sh + awk, then plant each fault
         run: sh tests/tr-spec.sh --prove-red
